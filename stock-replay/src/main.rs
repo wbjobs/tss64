@@ -13,11 +13,16 @@ where
     D: serde::Deserializer<'de>,
 {
     let s: String = Deserialize::deserialize(de)?;
-    s.trim()
-        .trim_matches('"')
-        .replace(',', "")
-        .parse::<f64>()
-        .map_err(serde::de::Error::custom)
+    let trimmed = s.trim().trim_matches('"').replace(',', "");
+    if trimmed.is_empty() {
+        return Err(serde::de::Error::custom("empty numeric field"));
+    }
+    let value: f64 = trimmed
+        .parse::<f64>().map_err(serde::de::Error::custom)?;
+    if !value.is_finite() {
+        return Err(serde::de::Error::custom("non-finite numeric value"));
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -35,6 +40,21 @@ pub struct DailyBar {
     pub volume: f64,
 }
 
+impl DailyBar {
+    fn is_valid(&self) -> bool {
+        self.date.len() > 0
+            && self.open.is_finite()
+            && self.close.is_finite()
+            && self.high.is_finite()
+            && self.low.is_finite()
+            && self.volume.is_finite()
+            && self.open > 0.0
+            && self.close > 0.0
+            && self.high > 0.0
+            && self.low > 0.0
+    }
+}
+
 pub struct ReplayEngine {
     bars: Vec<DailyBar>,
 }
@@ -45,18 +65,37 @@ impl ReplayEngine {
         let buf_reader = BufReader::with_capacity(8 * 1024 * 1024, file);
         let mut rdr = ReaderBuilder::new()
             .has_headers(true)
+            .flexible(true)
             .buffer_capacity(8 * 1024 * 1024)
             .from_reader(buf_reader);
 
         let mut bars: Vec<DailyBar> = Vec::with_capacity(5000);
-        for result in rdr.deserialize() {
+        let mut skipped = 0usize;
+        for (row_num, result) in rdr.deserialize().enumerate() {
             match result {
-                Ok(bar) => bars.push(bar),
-                Err(e) => eprintln!("warning: skip bad row: {}", e),
+                Ok(bar) => {
+                    let bar: DailyBar = bar;
+                    if bar.is_valid() {
+                        bars.push(bar);
+                    } else {
+                        skipped += 1;
+                        eprintln!("warning: row {} skipped: invalid bar data (date={})", row_num + 2, bar.date);
+                    }
+                }
+                Err(e) => {
+                    skipped += 1;
+                    eprintln!("warning: row {} skipped: parse error: {}", row_num + 2, e);
+                }
             }
         }
         bars.sort_by(|a, b| a.date.cmp(&b.date));
-        println!("loaded {} bars from {}", bars.len(), path.display());
+        bars.dedup_by(|a, b| a.date == b.date);
+        println!(
+            "loaded {} bars from {} (skipped {} invalid rows)",
+            bars.len(),
+            path.display(),
+            skipped
+        );
         Ok(ReplayEngine { bars })
     }
 
@@ -96,6 +135,8 @@ pub struct MaCrossStrategy {
     trade_entry_price: f64,
     trades: Vec<TradeRecord>,
     equity_curve: Vec<f64>,
+    running_peak: f64,
+    max_drawdown: f64,
 }
 
 #[derive(Debug)]
@@ -123,6 +164,8 @@ impl MaCrossStrategy {
             trade_entry_price: 0.0,
             trades: Vec::new(),
             equity_curve: Vec::new(),
+            running_peak: initial_capital,
+            max_drawdown: 0.0,
         }
     }
 
@@ -150,9 +193,9 @@ impl MaCrossStrategy {
             let long_ma = self.long_sum / self.long_queue.len() as f64;
 
             if let (Some(prev_s), Some(prev_l)) = (self.prev_short_ma, self.prev_long_ma) {
-                if prev_s <= prev_l && short_ma > long_ma {
+                if prev_s < prev_l && short_ma > long_ma {
                     signal = Signal::Buy;
-                } else if prev_s >= prev_l && short_ma < long_ma {
+                } else if prev_s > prev_l && short_ma < long_ma {
                     signal = Signal::Sell;
                 }
             }
@@ -162,8 +205,25 @@ impl MaCrossStrategy {
         }
 
         self.execute_signal(signal, close);
-        let equity = self.cash + self.position * close;
-        self.equity_curve.push(equity);
+
+        let equity_high = self.cash + self.position * bar.high;
+        let equity_low = self.cash + self.position * bar.low;
+        let equity_close = self.cash + self.position * close;
+
+        if equity_high.is_finite() && equity_high > self.running_peak {
+            self.running_peak = equity_high;
+        }
+
+        if self.running_peak > 0.0 && equity_low.is_finite() {
+            let dd = (self.running_peak - equity_low) / self.running_peak;
+            if dd > self.max_drawdown {
+                self.max_drawdown = dd;
+            }
+        }
+
+        if equity_close.is_finite() {
+            self.equity_curve.push(equity_close);
+        }
 
         signal
     }
@@ -196,8 +256,6 @@ impl MaCrossStrategy {
         let final_equity = *self.equity_curve.last().unwrap_or(&self.initial_capital);
         let total_return = (final_equity - self.initial_capital) / self.initial_capital;
 
-        let max_drawdown = compute_max_drawdown(&self.equity_curve);
-
         let total_trades = self.trades.len();
         let winning_trades = self.trades.iter().filter(|t| t.pnl > 0.0).count();
         let win_rate = if total_trades > 0 {
@@ -210,7 +268,7 @@ impl MaCrossStrategy {
             initial_capital: self.initial_capital,
             final_equity,
             total_return,
-            max_drawdown,
+            max_drawdown: self.max_drawdown,
             total_trades,
             winning_trades,
             win_rate,
@@ -218,13 +276,19 @@ impl MaCrossStrategy {
     }
 }
 
+#[allow(dead_code)]
 fn compute_max_drawdown(equity_curve: &[f64]) -> f64 {
-    if equity_curve.is_empty() {
+    let valid: Vec<f64> = equity_curve
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .collect();
+    if valid.is_empty() {
         return 0.0;
     }
-    let mut peak = equity_curve[0];
+    let mut peak = valid[0];
     let mut max_dd = 0.0;
-    for &equity in equity_curve {
+    for &equity in &valid {
         if equity > peak {
             peak = equity;
         }

@@ -1,1 +1,1 @@
-E:\trae66\tss64\stock-replay\target\release\stock-replay.exe: E:\trae66\tss64\stock-replay\src\main.rs
+E:\trae66\tss64\stock-replay\target\release\stock-replay.exe: E:\trae66\tss64\stock-replay\src\bar.rs E:\trae66\tss64\stock-replay\src\data.rs E:\trae66\tss64\stock-replay\src\engine.rs E:\trae66\tss64\stock-replay\src\main.rs E:\trae66\tss64\stock-replay\src\strategy.rs

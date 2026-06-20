@@ -3,11 +3,16 @@ name = "stock-replay"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["postgres"]
+postgres = ["dep:postgres"]
+
 [dependencies]
 csv = "1"
 serde = { version = "1", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+postgres = { version = "0.19", optional = true }
 
 [profile.release]
 opt-level = 3
